@@ -3,6 +3,9 @@
 #include "Session.h"
 #include "OVR_CAPI.h"
 #include "XR_Math.h"
+#ifdef _DEBUG
+#include "Debug.h"
+#endif
 
 #include <Windows.h>
 #include <openxr/openxr.h>
@@ -99,8 +102,10 @@ ovrResult InputManager::SubmitControllerVibration(ovrSession session, ovrControl
 {
 	for (InputDevice* device : m_InputDevices)
 	{
-		if (controllerType & device->GetType() && device->IsConnected())
+		if (controllerType & device->GetType() && device->IsConnected()) {
+			device->StartHaptics(session->Session);
 			device->SubmitVibration(controllerType, buffer);
+		}
 	}
 
 	return ovrSuccess;
@@ -158,32 +163,42 @@ XrTime InputManager::AbsTimeToXrTime(XrInstance instance, double absTime)
 
 unsigned int InputManager::SpaceRelationToPoseState(const XrSpaceLocation& location, double time, ovrPoseStatef& lastPoseState, ovrPoseStatef& outPoseState)
 {
-	if (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
+	unsigned int flags = 0;
+
+	if (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
 		outPoseState.ThePose.Orientation = XR::Quatf(location.pose.orientation);
-	else
+		flags |= ovrStatus_OrientationValid;
+		flags |= (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) ? ovrStatus_OrientationTracked : 0;
+	}
+	else {
 		outPoseState.ThePose.Orientation = XR::Quatf::Identity();
+	}
 
-	if (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+	if (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) {
 		outPoseState.ThePose.Position = XR::Vector3f(location.pose.position);
-	else
+		flags |= ovrStatus_PositionValid;
+		flags |= (location.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) ? ovrStatus_PositionTracked : 0;
+	}
+	else {
 		outPoseState.ThePose.Position = XR::Vector3f::Zero();
+	}
 
-	XrSpaceVelocity *currv = (XrSpaceVelocity *) location.next;
+	XrSpaceVelocity *spaceVelocity = (XrSpaceVelocity *) location.next;
 
-	if (location.locationFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
-		XR::Vector3f currav(currv->angularVelocity);
+	if (spaceVelocity->velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
+		XR::Vector3f currav(spaceVelocity->angularVelocity);
 		outPoseState.AngularVelocity = currav;
-		outPoseState.AngularAcceleration = (currav - OVR::Vector3f(lastPoseState.AngularVelocity)) / float(time - lastPoseState.TimeInSeconds);
+		outPoseState.AngularAcceleration = time > lastPoseState.TimeInSeconds ? (currav - XR::Vector3f(lastPoseState.AngularVelocity)) / (time - lastPoseState.TimeInSeconds) : lastPoseState.AngularAcceleration;
 	}
 	else {
 		outPoseState.AngularVelocity = XR::Vector3f::Zero();
 		outPoseState.AngularAcceleration = XR::Vector3f::Zero();
 	}
 
-	if (location.locationFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
-		XR::Vector3f currlv(currv->linearVelocity);
+	if (spaceVelocity->velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
+		XR::Vector3f currlv(spaceVelocity->linearVelocity);
 		outPoseState.LinearVelocity = currlv;
-		outPoseState.LinearAcceleration = (currlv - OVR::Vector3f(lastPoseState.LinearVelocity)) / float(time - lastPoseState.TimeInSeconds);
+		outPoseState.LinearAcceleration = time > lastPoseState.TimeInSeconds ? (currlv - XR::Vector3f(lastPoseState.LinearVelocity)) / (time - lastPoseState.TimeInSeconds) : lastPoseState.LinearAcceleration;
 	}
 	else {
 		outPoseState.LinearVelocity = XR::Vector3f::Zero();
@@ -192,17 +207,17 @@ unsigned int InputManager::SpaceRelationToPoseState(const XrSpaceLocation& locat
 
 	outPoseState.TimeInSeconds = time;
 
-	return (location.locationFlags >> 6) & (ovrStatus_OrientationTracked | ovrStatus_PositionTracked) |
-		(location.locationFlags << 2) & (ovrStatus_OrientationValid | ovrStatus_PositionValid);
+	return flags;
 }
 
-#ifdef DEBUG_TRACKING
-#include <fstream>
-#include <iomanip>
-#endif /* DEBUG_TRACKING */
+#ifdef _DEBUG
+ReviveTrackingPlotter trackingPlotter(1000);
+#endif
 
 void InputManager::GetTrackingState(ovrSession session, ovrTrackingState* outState, double absTime)
 {
+	double calledTime = absTime;
+
 	if (absTime <= 0.0)
 		absTime = ovr_GetTimeInSeconds();
 
@@ -230,63 +245,13 @@ void InputManager::GetTrackingState(ovrSession session, ovrTrackingState* outSta
 		}
 
 		outState->HandStatusFlags[i] = SpaceRelationToPoseState(handLocation, absTime, m_LastTrackingState.HandPoses[i], outState->HandPoses[i]);
-
 	}
 
-#ifdef DEBUG_TRACKING
-	static int tcc = 0;
-	static bool first = false;
-
-	if (tcc == 0) {
-		std::ofstream fout("head-tracking.csv", std::ofstream::app);
-		if (!first)
-			fout << "Time,AngularVelocity,Time,AngularAcceleration,Time,LinearVelocity,Time,LinearAcceleration" << std::endl;
-		XR::Vector3f angvel(outState->HeadPose.AngularVelocity);
-		XR::Vector3f angacc(outState->HeadPose.AngularAcceleration);
-		XR::Vector3f linvel(outState->HeadPose.LinearVelocity);
-		XR::Vector3f linacc(outState->HeadPose.LinearAcceleration);
-		fout << std::fixed << std::setprecision(8);
-		fout << absTime << ',' << angvel.Length() << ',';
-		fout << absTime << ',' << angacc.Length() << ',';
-		fout << absTime << ',' << linvel.Length() << ',';
-		fout << absTime << ',' << linacc.Length();
-		fout << std::endl;
-		fout.close();
-
-		std::ofstream h0out("hand0-tracking.csv", std::ofstream::app);
-		if (!first)
-			h0out << "Time,AngularVelocity,Time,AngularAcceleration,Time,LinearVelocity,Time,LinearAcceleration" << std::endl;
-		XR::Vector3f h0angvel(outState->HandPoses[0].AngularVelocity);
-		XR::Vector3f h0angacc(outState->HandPoses[0].AngularAcceleration);
-		XR::Vector3f h0linvel(outState->HandPoses[0].LinearVelocity);
-		XR::Vector3f h0linacc(outState->HandPoses[0].LinearAcceleration);
-		h0out << std::fixed << std::setprecision(8);
-		h0out << absTime << ',' << h0angvel.Length() << ',';
-		h0out << absTime << ',' << h0angacc.Length() << ',';
-		h0out << absTime << ',' << h0linvel.Length() << ',';
-		h0out << absTime << ',' << h0linacc.Length();
-		h0out << std::endl;
-		h0out.close();
-
-		std::ofstream h1out("hand1-tracking.csv", std::ofstream::app);
-		if (!first)
-			h1out << "Time,AngularVelocity,Time,AngularAcceleration,Time,LinearVelocity,Time,LinearAcceleration" << std::endl;
-		XR::Vector3f h1hangvel(outState->HandPoses[1].AngularVelocity);
-		XR::Vector3f h1hangacc(outState->HandPoses[1].AngularAcceleration);
-		XR::Vector3f h1linvel(outState->HandPoses[1].LinearVelocity);
-		XR::Vector3f h1linacc(outState->HandPoses[1].LinearAcceleration);
-		h1out << std::fixed << std::setprecision(8);
-		h1out << absTime << ',' << h1hangvel.Length() << ',';
-		h1out << absTime << ',' << h1hangacc.Length() << ',';
-		h1out << absTime << ',' << h1linvel.Length() << ',';
-		h1out << absTime << ',' << h1linacc.Length();
-		h1out << std::endl;
-		h1out.close();
-	}
-
-	first = true;
-	tcc = (++tcc % 3);
-#endif /* DEBUG_TRACKING */
+#ifdef _DEBUG
+	trackingPlotter.SampleValue(*outState, session->NextFrame, absTime, calledTime);
+	if ((trackingPlotter.size() % 8) == 0)
+		trackingPlotter.plot();
+#endif
 
 	m_LastTrackingState = *outState;
 
@@ -464,7 +429,7 @@ void InputManager::OculusTouch::HapticsThread(XrSession session, OculusTouch* de
 			}
 		}
 
-		std::this_thread::sleep_for(freq);
+		// std::this_thread::sleep_for(freq);
 	}
 }
 
@@ -497,6 +462,9 @@ InputManager::OculusTouch::~OculusTouch()
 
 void InputManager::OculusTouch::StartHaptics(XrSession session)
 {
+	if (m_bHapticsRunning)
+		return;
+
 	m_bHapticsRunning = true;
 	m_HapticsThread = std::thread(HapticsThread, session, this);
 }
